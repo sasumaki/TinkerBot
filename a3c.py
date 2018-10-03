@@ -3,6 +3,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import threading
 from SuperbotEnv import SuperbotEnv
+from RewardCritic import RewardCritic
 import numpy as np
 import multiprocessing
 import argparse
@@ -11,16 +12,21 @@ import matplotlib.pyplot as plt
 
 
 import tensorflow as tf
-from tensorflow.python import keras
-from tensorflow.python.keras import layers
+from tensorflow import keras
+from tensorflow.keras import layers
 
 tf.enable_eager_execution()
 
 parser = argparse.ArgumentParser(description='Run A3C algorithm on the game')
 
+parser.add_argument('--url', default="https://www.varusteleka.com", type=str,
+                    help='Specify a url domain you want to crawl')
+parser.add_argument('--threads', default=multiprocessing.cpu_count(), type=int,
+                    choices=range(1,multiprocessing.cpu_count()+1), help='Set number of threads to use.')
+parser.add_argument('--verbose', action='store_true')
 parser.add_argument('--lr', default=0.001,
                     help='Learning rate for the shared optimizer.')
-parser.add_argument('--update-freq', default=20, type=int,
+parser.add_argument('--update-freq', default=10, type=int,
                     help='How often to update the global model.')
 parser.add_argument('--max-eps', default=1000, type=int,
                     help='Global maximum number of episodes to run.')
@@ -35,10 +41,12 @@ class ActorCriticModel(keras.Model):
     super(ActorCriticModel, self).__init__()
     self.state_size = state_size
     self.action_size = action_size
-    self.conv1 = layers.Conv2D(100, kernel_size=(32,32), input_shape=((1, 128, 128, 4)), strides=1, padding='valid', activation='relu')
+    self.conv1 = layers.Conv2D(32, kernel_size=(8,8), input_shape=((-1, 128, 128, 3)), strides=1, padding='valid', activation='relu', data_format="channels_last")
     self.flatten = layers.Flatten()
     self.dense1 = layers.Dense(100, activation='relu')
     self.policy_logits = layers.Dense(action_size, activation="sigmoid")
+    self.conv2 = layers.Conv2D(32, kernel_size=(8,8), input_shape=((-1, 128, 128, 3)), strides=1, padding='valid', activation='relu', data_format="channels_last")
+    self.flatten2 = layers.Flatten()
     self.dense2 = layers.Dense(100, activation='relu')
     self.values = layers.Dense(1)
 
@@ -47,8 +55,10 @@ class ActorCriticModel(keras.Model):
     x1 = self.flatten(x)
     x2 = self.dense1(x1)
     logits = self.policy_logits(x2)
-    v1 = self.dense2(inputs)
-    values = self.values(v1)
+    v1 = self.conv2(inputs)
+    v2 = self.flatten2(v1)
+    v3 = self.dense2(v2)
+    values = self.values(v3)
     return logits, values
 
 def record(episode,
@@ -81,8 +91,8 @@ class MasterAgent():
     self.save_dir = save_dir
     if not os.path.exists(save_dir):
       os.makedirs(save_dir)
-
-    env = SuperbotEnv("https://www.varusteleka.com")
+    self.rewardCritic = RewardCritic()
+    env = SuperbotEnv(args.url, verbose=args.verbose, rewardCritic=self.rewardCritic)
     self.state_size = env.observation_space.shape
     self.action_size = env.action_space.shape[0]
     self.opt = tf.train.AdamOptimizer(args.lr, use_locking=True)
@@ -101,7 +111,8 @@ class MasterAgent():
                       self.global_model,
                       self.opt, res_queue,
                       i, game_name=self.game_name,
-                      save_dir=self.save_dir) for i in range(multiprocessing.cpu_count())] #multiprocessing.cpu_count()
+                      save_dir=self.save_dir,
+                      rewardCritic=self.rewardCritic) for i in range(args.threads)]
 
     for i, worker in enumerate(workers):
       print("Starting worker {}".format(i))
@@ -149,17 +160,19 @@ class Worker(threading.Thread):
                result_queue,
                idx,
                game_name='superbot',
-               save_dir='/tmp'):
+               save_dir='/tmp', rewardCritic=None):
     super(Worker, self).__init__()
     self.state_size = state_size
     self.action_size = action_size
     self.result_queue = result_queue
     self.global_model = global_model
     self.opt = opt
+    self.verbose = args.verbose
     self.local_model = ActorCriticModel(self.state_size, self.action_size)
     self.worker_idx = idx
     self.game_name = game_name
-    self.env = SuperbotEnv("https://www.varusteleka.com", idx)
+    self.rewardCritic = rewardCritic
+    self.env = SuperbotEnv(args.url, idx, self.verbose, rewardCritic)
     self.save_dir = save_dir
     self.ep_loss = 0.0
 
@@ -177,11 +190,10 @@ class Worker(threading.Thread):
       done = False
       while not done:
         logits, _ = self.local_model(
-            tf.convert_to_tensor(current_state[None, :],
+            tf.convert_to_tensor(current_state,
                                  dtype=tf.float32))
         probs = tf.nn.softmax(logits)
         action = np.random.choice(self.action_size, p=probs.numpy()[0])
-        print('probs: ', probs[0], 'action: ', action)
         new_state, reward, done, _ = self.env.step(action)
         if done:
           reward = -1
@@ -240,21 +252,19 @@ class Worker(threading.Thread):
       reward_sum = 0.  
     else:
       reward_sum = self.local_model(
-          tf.convert_to_tensor(new_state[None, :],
+          tf.convert_to_tensor(new_state,
                                dtype=tf.float32))[-1].numpy()[0]
     discounted_rewards = []
     for reward in memory.rewards[::-1]: 
       reward_sum = reward + gamma * reward_sum
       discounted_rewards.append(reward_sum)
     discounted_rewards.reverse()
-
     logits, values = self.local_model(
         tf.convert_to_tensor(np.vstack(memory.states),
                              dtype=tf.float32))
     advantage = tf.convert_to_tensor(np.array(discounted_rewards)[:, None],
                             dtype=tf.float32) - values
     value_loss = advantage ** 2
-
     policy = tf.nn.softmax(logits)
     entropy = tf.nn.softmax_cross_entropy_with_logits_v2(labels=policy, logits=logits)
 
@@ -263,6 +273,14 @@ class Worker(threading.Thread):
     policy_loss *= tf.stop_gradient(advantage)
     policy_loss -= 0.01 * entropy
     total_loss = tf.reduce_mean((0.5 * value_loss + policy_loss))
+    if args.verbose == True:
+      print(
+      f"discounted_rewards: {discounted_rewards} |"
+      f"values: {values} |"
+      f"advantage: {advantage} | "
+      f"policy: {policy} | "
+      f"entropy: {entropy} | "
+      f"total_loss: {total_loss}")
     return total_loss
 
 
