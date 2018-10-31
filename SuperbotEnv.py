@@ -12,23 +12,26 @@ from urllib.parse import urlparse
 class SuperbotEnv():
   
 
-  def __init__(self, url, worker_id = -1, verbose=False, rewardCritic=None):
+  def __init__(self, url, worker_id = -1, verbose=False, rewardCritic=None, mapping=False):
     capabilities = DesiredCapabilities().CHROME
     capabilities["pageLoadStrategy"] = "none"
     capabilities['loggingPrefs'] = { 'browser':'ALL' }
+    self.mapping = mapping
+    self.possible_actions = []
+    if not mapping:
+      f = open('hrefs.txt', 'r', encoding="utf-8")
+      self.possible_actions = f.read().splitlines()
+      f.close()
+      self.observation_space = np.zeros((128, 128, 3), dtype=np.float32)
+      self.action_space = np.zeros(len(self.possible_actions), dtype=np.float32)
+      self.rewardCritic = rewardCritic
 
-    f = open('hrefs.txt', 'r', encoding="utf-8")
-    self.possible_actions = f.read().splitlines()
-    f.close()
     self.url = url
     self.worker_idx = worker_id
     self.picname = 'pic' + str(worker_id) + '.png'
-    self.observation_space = np.zeros((128, 128, 3), dtype=np.float32)
-    self.action_space = np.zeros(len(self.possible_actions), dtype=np.float32)
     self.verbose = verbose
     if worker_id > -1:
       self.driver = webdriver.Chrome(desired_capabilities=capabilities)
-    self.rewardCritic = rewardCritic
 
 
   def step(self, action):
@@ -36,40 +39,45 @@ class SuperbotEnv():
     click the defined "action" and take a save the following as new state.
     dynamic action space?
     """
-    self.step_count += 1
-    reward = 1
-
-    selected_action = self.possible_actions[action]
-    selector = 'a[href="/' + selected_action + '"]'
-    try:
-      if (self.verbose == True):
-        print('worker ', self.worker_idx, ' going to: ', selected_action)
-      response = self.visit_or_click(click = selector)
-      
-    except Exception as e:
-      if (self.verbose == True):
-        print(e)
-      return(self.state, reward, False, {})
-        
-
-    # self.state_possible_actions = []
-    # for element in self.driver.find_elements_by_css_selector("a"):
-    #   href = element.get_attribute('href')
-    #   if element.is_displayed() and re.match(r'^' + self.url + r'/', href) is not None:
-    #     self.state_possible_actions.append(href)
-
-    self.driver.save_screenshot(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'pics', self.picname))
-    self.state = np.array(Image.open(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'pics', self.picname)).resize((128,128), Image.ANTIALIAS).convert('RGB')).reshape(1,128,128,3)
-    lost = "https://www.varusteleka.com" not in self.driver.current_url
-
-    reward = self.rewardCritic.evaluate(self.state, selected_action)
-    if self.step_count > 50 or lost == True:
-      if lost == True:
-        reward = 0
-      done = True
+    if self.mapping:
+      elems = self.driver.find_elements_by_xpath("//a[@href]")
+      for elem in elems:
+        self.possible_actions.append(elem.get_attribute("href"))
     else:
-      done = False
-    return(self.state, reward, done, {})
+      self.step_count += 1
+      reward = 0
+      
+      selected_action = self.possible_actions[action]
+      selector = 'a[href="/' + selected_action + '"]'
+      response = None
+      try:
+        if (self.verbose == True):
+          print('worker ', self.worker_idx, ' going to: ', selected_action)
+        response = self.visit_or_click(click = selector)
+      except Exception as e:
+        lost =  not self.driver.current_url.startswith(self.url)
+        if lost:
+          return(self.state, reward, True, {})
+        if (self.verbose == True):
+          print(e)
+        return(self.state, reward, False, {})
+          
+
+      # self.state_possible_actions = []
+      # for element in self.driver.find_elements_by_css_selector("a"):
+      #   href = element.get_attribute('href')
+      #   if element.is_displayed() and re.match(r'^' + self.url + r'/', href) is not None:
+      #     self.state_possible_actions.append(href)
+
+      self.driver.save_screenshot(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'pics', self.picname))
+      self.state = np.array(Image.open(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'pics', self.picname)).resize((128,128), Image.ANTIALIAS).convert('RGB')).reshape(1,128,128,3)
+
+      reward = self.rewardCritic.evaluate(self.state, response)
+      if self.step_count > 50:
+        done = True
+      else:
+        done = False
+      return(self.state, reward, done, {})
 
   def reset(self):
     self.step_count = 0
@@ -143,8 +151,8 @@ class SuperbotEnv():
     render_took, was_unstable = self.wait_for_stable_render()
     total_took = (visit_took + render_took)
     stopped_url = self.driver.current_url
-
-    print(f"..completed as ",  "un" if was_unstable else "stable -", f" visit {visit_took:.2f}, render {render_took:.2f}")
+    if self.verbose:
+      print(f"..completed as ",  "un" if was_unstable else "stable -", f" visit {visit_took:.2f}, render {render_took:.2f}")
 
     response = {
       "action": ('visit' if visit else 'click'),
@@ -169,7 +177,6 @@ class SuperbotEnv():
     }
 
     for log_entry in self.driver.get_log('browser'):
-      print(log_entry)
       if log_entry["level"] == "WARNING":
         response["logs"]["warning"] = log_entry.message
       if log_entry["level"] == "SEVERE":
@@ -211,10 +218,6 @@ class SuperbotEnv():
         raise f"unknown log level: {log_entry.level}"
     if not response["status"]:
       response["status"] = 200
-
-    if self.verbose:
-      print(response)
-
     return response
 
   

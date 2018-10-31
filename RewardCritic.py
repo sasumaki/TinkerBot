@@ -18,14 +18,15 @@ class RewardCritic(keras.Model):
     super(RewardCritic, self).__init__()
     self.default_reward = 0
 
-  def evaluate(self, state, url):
-    levels = url.split('/')
+  def evaluate(self, state, response):
+    levels = response["transition"]["to_url"].split('/')
     route = 'pics/all/' + '/'.join(levels[:-1])
     if len(levels) > 1:
       pathlib.Path(route).mkdir(parents=True, exist_ok=True) 
     imroute = route + '/' +str(uuid4()) + ".png"
     imageio.imsave(imroute, np.squeeze(state))
-    reward = self.default_reward
+    reward = response["duration"]["total"]
+    
     return(reward)
 
 

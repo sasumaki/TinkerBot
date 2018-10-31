@@ -9,7 +9,7 @@ import multiprocessing
 import argparse
 from queue import Queue
 import matplotlib.pyplot as plt
-
+import subprocess
 
 import tensorflow as tf
 from tensorflow import keras
@@ -24,6 +24,8 @@ parser.add_argument('--url', default="https://www.varusteleka.com", type=str,
 parser.add_argument('--threads', default=multiprocessing.cpu_count(), type=int,
                     choices=range(1,multiprocessing.cpu_count()+1), help='Set number of threads to use.')
 parser.add_argument('--verbose', action='store_true')
+parser.add_argument('--map', action='store_true')
+
 parser.add_argument('--lr', default=0.001,
                     help='Learning rate for the shared optimizer.')
 parser.add_argument('--update-freq', default=10, type=int,
@@ -103,9 +105,11 @@ class MasterAgent():
 
 
   def train(self):
+    if args.map:
+      print("mapping possible actions...")
+      subprocess.call(["./gethrefs.sh", args.url])
 
     res_queue = Queue()
-
     workers = [Worker(self.state_size,
                       self.action_size,
                       self.global_model,
